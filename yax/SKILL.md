@@ -13,9 +13,11 @@ CLI tool for Yandex Disk, Calendar, and Mail via Yandex OAuth API.
 1. Create a Yandex OAuth app at https://oauth.yandex.ru/client/new
    - Redirect URI: `https://oauth.yandex.ru/verification_code`
    - Required scopes:
-     - `cloud_api:disk.app_folder` (or `cloud_api:disk.read`, `cloud_api:disk.write`)
-     - `calendar:all` (for calendar access)
-   - Note the Client ID
+     - `cloud_api:disk.app_folder` — Disk app folder access
+     - `cloud_api:disk.info` — Disk info
+     - `calendar:all` — Calendar read/write
+     - `mail:smtp` — Mail sending (SMTP only, no HTTP API)
+   - Note the Client ID and Client Secret
 
 2. Save config to `~/.openclaw/yax.env`:
    ```

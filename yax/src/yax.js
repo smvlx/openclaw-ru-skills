@@ -66,33 +66,72 @@ async function auth() {
     process.exit(1);
   }
   const clientSecret = env.YAX_CLIENT_SECRET || '';
+  const mode = process.argv[3] || 'device'; // 'device' or 'code'
 
-  console.log(`Open this URL in your browser:\n`);
-  console.log(`https://oauth.yandex.ru/authorize?response_type=code&client_id=${clientId}&redirect_uri=https://oauth.yandex.ru/verification_code\n`);
+  if (mode === 'device') {
+    // Device code flow (no browser needed on this machine)
+    const dcBody = `client_id=${clientId}`;
+    const dcRes = await request({
+      hostname: 'oauth.yandex.ru',
+      path: '/device/code',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(dcBody) },
+    }, dcBody);
+    const dc = JSON.parse(dcRes.body.toString());
+    if (!dc.device_code) { console.error('Device code error:', dc); return; }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const code = await new Promise(r => rl.question('Enter the verification code: ', r));
-  rl.close();
+    console.log(`\nGo to: ${dc.verification_url}`);
+    console.log(`Enter code: ${dc.user_code}\n`);
+    console.log(`Waiting for authorization (${dc.expires_in}s)...`);
 
-  let postBody = `grant_type=authorization_code&code=${code}&client_id=${clientId}`;
-  if (clientSecret) postBody += `&client_secret=${clientSecret}`;
-
-  const res = await request({
-    hostname: 'oauth.yandex.ru',
-    path: '/token',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Content-Length': Buffer.byteLength(postBody),
-    },
-  }, postBody);
-
-  const data = JSON.parse(res.body.toString());
-  if (data.access_token) {
-    saveToken(data);
-    console.log('Authenticated successfully! Token saved.');
+    const interval = (dc.interval || 5) * 1000;
+    const deadline = Date.now() + dc.expires_in * 1000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, interval));
+      let tokenBody = `grant_type=device_code&code=${dc.device_code}&client_id=${clientId}`;
+      if (clientSecret) tokenBody += `&client_secret=${clientSecret}`;
+      const tRes = await request({
+        hostname: 'oauth.yandex.ru', path: '/token', method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(tokenBody) },
+      }, tokenBody);
+      const tData = JSON.parse(tRes.body.toString());
+      if (tData.access_token) {
+        saveToken(tData);
+        console.log('Authenticated successfully! Token saved.');
+        return;
+      }
+      if (tData.error !== 'authorization_pending') {
+        console.error('Auth error:', tData);
+        return;
+      }
+    }
+    console.error('Authorization timed out');
   } else {
-    console.error('Auth failed:', data);
+    // Manual code flow
+    console.log(`Open this URL in your browser:\n`);
+    console.log(`https://oauth.yandex.ru/authorize?response_type=code&client_id=${clientId}&redirect_uri=https://oauth.yandex.ru/verification_code\n`);
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const code = await new Promise(r => rl.question('Enter the verification code: ', r));
+    rl.close();
+
+    let postBody = `grant_type=authorization_code&code=${code}&client_id=${clientId}`;
+    if (clientSecret) postBody += `&client_secret=${clientSecret}`;
+
+    const res = await request({
+      hostname: 'oauth.yandex.ru',
+      path: '/token',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(postBody) },
+    }, postBody);
+
+    const data = JSON.parse(res.body.toString());
+    if (data.access_token) {
+      saveToken(data);
+      console.log('Authenticated successfully! Token saved.');
+    } else {
+      console.error('Auth failed:', data);
+    }
   }
 }
 
