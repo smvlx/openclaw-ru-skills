@@ -218,29 +218,42 @@ async function diskDownload(remotePath, localPath) {
 }
 
 // --- Calendar (CalDAV) ---
+async function calendarHome(token) {
+  // Discover principal
+  const principalBody = '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>';
+  const pRes = await request({
+    hostname: 'caldav.yandex.ru', path: '/principals/', method: 'PROPFIND',
+    headers: { 'Authorization': `OAuth ${token}`, 'Content-Type': 'application/xml', 'Depth': '0', 'Content-Length': Buffer.byteLength(principalBody) },
+  }, principalBody);
+  const pText = pRes.body.toString();
+  const principalMatch = pText.match(/<D:current-user-principal>.*?<D:href>([^<]+)<\/D:href>/i);
+  if (!principalMatch) throw new Error('Cannot discover principal');
+
+  // Get calendar-home-set
+  const homeBody = '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>';
+  const hRes = await request({
+    hostname: 'caldav.yandex.ru', path: principalMatch[1], method: 'PROPFIND',
+    headers: { 'Authorization': `OAuth ${token}`, 'Content-Type': 'application/xml', 'Depth': '0', 'Content-Length': Buffer.byteLength(homeBody) },
+  }, homeBody);
+  const hText = hRes.body.toString();
+  const homeMatch = hText.match(/<D:href>([^<]*calendars[^<]*)<\/D:href>/i);
+  if (!homeMatch) throw new Error('Cannot discover calendar home');
+  return homeMatch[1];
+}
+
 async function calendarList() {
   const token = getToken();
-  const body = `<?xml version="1.0" encoding="utf-8"?>
+  const home = await calendarHome(token);
+  const body = `<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <d:displayname/>
-    <d:resourcetype/>
-  </d:prop>
+  <d:prop><d:displayname/><d:resourcetype/></d:prop>
 </d:propfind>`;
   const res = await request({
-    hostname: 'caldav.yandex.ru',
-    path: '/calendars/',
-    method: 'PROPFIND',
-    headers: {
-      'Authorization': `OAuth ${token}`,
-      'Content-Type': 'application/xml',
-      'Depth': '1',
-      'Content-Length': Buffer.byteLength(body),
-    },
+    hostname: 'caldav.yandex.ru', path: home, method: 'PROPFIND',
+    headers: { 'Authorization': `OAuth ${token}`, 'Content-Type': 'application/xml', 'Depth': '1', 'Content-Length': Buffer.byteLength(body) },
   }, body);
   const text = res.body.toString();
-  // Simple parse displaynames
-  const names = [...text.matchAll(/<d:displayname>([^<]+)<\/d:displayname>/gi)];
+  const names = [...text.matchAll(/<[Dd]:displayname>([^<]+)<\/[Dd]:displayname>/gi)];
   if (names.length) {
     names.forEach(m => console.log(`📅 ${m[1]}`));
   } else {
@@ -251,9 +264,10 @@ async function calendarList() {
 
 async function calendarCreate(name, date, time, description) {
   const token = getToken();
+  const home = await calendarHome(token);
   const uid = `yax-${Date.now()}@openclaw`;
   const dtStart = `${date.replace(/-/g, '')}T${(time || '120000').replace(/:/g, '')}`;
-  const dtEnd = dtStart; // 0-duration event
+  const dtEnd = dtStart;
   const ics = [
     'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//yax//openclaw//EN',
     'BEGIN:VEVENT', `UID:${uid}`, `DTSTART:${dtStart}`, `DTEND:${dtEnd}`,
@@ -261,9 +275,10 @@ async function calendarCreate(name, date, time, description) {
     'END:VEVENT', 'END:VCALENDAR'
   ].join('\r\n');
 
+  // Put into the first calendar (events-default)
   const res = await request({
     hostname: 'caldav.yandex.ru',
-    path: `/calendars/events/${uid}.ics`,
+    path: `${home}events-default/${uid}.ics`,
     method: 'PUT',
     headers: {
       'Authorization': `OAuth ${token}`,
