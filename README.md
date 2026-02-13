@@ -1,60 +1,52 @@
 # OpenClaw Russian AI Skills
 
-Three OpenClaw skills for integrating Russian AI services: **GigaChat** (Sber), **YandexGPT**, and **Yandex 360** (Disk/Calendar).
+OpenClaw skills for **GigaChat** (Sber), **YandexGPT**, and **Yandex 360** (Disk/Calendar).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## What This Enables
 
-## Features
+Your OpenClaw agent can:
 
-- 🤖 **GigaChat** - Sber's AI models (Lite, Pro, Max) via OpenAI-compatible proxy
-- 🦊 **YandexGPT** - Yandex Foundation Models (lite, default, 32k) via OpenAI-compatible proxy  
-- 📁 **Yandex 360** - Disk (upload/download) and Calendar (create/list events) via OAuth
+- 🤖 **GigaChat** - Use Sber AI models (Lite, Pro, Max) or create Russian-speaking subagents
+- 🦊 **YandexGPT** - Use Yandex Foundation Models (lite, default, 32k) or create subagents
+- 📁 **Yandex Disk** - Upload/download files, manage folders
+- 📅 **Yandex Calendar** - Create/list calendar events with timezone support
 
-All skills use OAuth authentication and work on Linux & macOS.
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 16+ (for yax)
-- Python 3.8+ (for GigaChat proxy)
-- OpenClaw installed ([openclaw.ai](https://openclaw.ai))
-
-### Installation
+## Installation
 
 ```bash
-cd ~/.openclaw/skills
+cd /openclaw/skills
 git clone https://github.com/smvlx/openclaw-ru-skills.git
-cd openclaw-ru-skills
 ```
 
-### Setup
+OpenClaw will auto-discover skills in `/openclaw/skills/`.
 
-Each skill has its own setup script:
+## Configuration
 
+### 1. GigaChat (Sber AI)
+
+**Get credentials:**
+1. Register at https://developers.sber.ru/
+2. Create GigaChat API application
+3. Note Client ID and Client Secret
+
+**Setup:**
 ```bash
-# GigaChat
-./gigachat/scripts/setup.sh
+# Create env file
+cat > ~/.openclaw/gigachat-new.env << EOF
+CLIENT_ID="your-client-id"
+CLIENT_SECRET="your-client-secret"
+GIGACHAT_CREDENTIALS=$(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)
+GIGACHAT_SCOPE="GIGACHAT_API_PERS"
+EOF
 
-# YandexGPT
-./yandexgpt/scripts/setup.sh
+# Install proxy
+pip3 install gpt2giga
 
-# Yandex 360
-./yax/scripts/setup.sh
+# Start proxy (runs on localhost:8443)
+/openclaw/skills/gigachat/scripts/start-proxy.sh
 ```
 
-Follow the prompts to configure API credentials and OAuth tokens.
-
-## Usage
-
-### GigaChat
-
-**1. Start the proxy:**
-```bash
-./gigachat/scripts/start-proxy.sh
-```
-
-**2. Configure OpenClaw** (`~/.openclaw/openclaw.json`):
+**Add to `openclaw.json`:**
 ```json
 {
   "models": {
@@ -74,7 +66,7 @@ Follow the prompts to configure API credentials and OAuth tokens.
 }
 ```
 
-**3. Create an agent:**
+**Optional - Create Russian subagent:**
 ```json
 {
   "agents": {
@@ -83,21 +75,37 @@ Follow the prompts to configure API credentials and OAuth tokens.
         "id": "ruslan",
         "name": "Ruslan",
         "emoji": "🐻",
-        "model": "gigachat/GigaChat-Pro"
+        "model": "gigachat/GigaChat-Pro",
+        "workspace": "~/.openclaw/agents/ruslan/workspace"
       }
     ]
   }
 }
 ```
 
-### YandexGPT
+---
 
-**1. Start the proxy:**
+### 2. YandexGPT (Foundation Models)
+
+**Get credentials:**
+1. Create service account at https://console.cloud.yandex.ru/iam
+2. Grant `ai.languageModels.user` role
+3. Create API key
+
+**Setup:**
 ```bash
-./yandexgpt/scripts/start.sh
+# Create env file
+cat > ~/.openclaw/yandexgpt.env << EOF
+YANDEX_API_KEY="your-api-key"
+YANDEX_FOLDER_ID="your-folder-id"
+YANDEX_PROXY_PORT="8444"
+EOF
+
+# Start proxy (runs on localhost:8444)
+/openclaw/skills/yandexgpt/scripts/start.sh
 ```
 
-**2. Configure OpenClaw:**
+**Add to `openclaw.json`:**
 ```json
 {
   "models": {
@@ -117,134 +125,96 @@ Follow the prompts to configure API credentials and OAuth tokens.
 }
 ```
 
-**3. Create an agent:**
-```json
-{
-  "agents": {
-    "list": [
-      {
-        "id": "yasha",
-        "name": "Яша",
-        "emoji": "🦊",
-        "model": "yandexgpt/yandexgpt"
-      }
-    ]
-  }
-}
-```
+---
 
-### Yandex 360 (Disk & Calendar)
+### 3. Yandex 360 (Disk & Calendar)
 
-**1. Authenticate:**
+**Get credentials:**
+1. Create OAuth app at https://oauth.yandex.ru/client/new
+2. Scopes: `cloud_api:disk.app_folder`, `cloud_api:disk.info`, `calendar:all`
+3. Note Client ID
+
+**Setup:**
 ```bash
-cd yax
-node src/yax.cjs auth
+# Create env file
+cat > ~/.openclaw/yax.env << EOF
+YAX_CLIENT_ID="your-client-id"
+YAX_CLIENT_SECRET="your-client-secret-if-any"
+EOF
+
+# Authenticate (device code flow - agent can do this)
+cd /openclaw/skills/yax
+node src/yax.cjs auth device
+# Agent will get URL and code to show user
 ```
 
-**2. Use the CLI:**
-```bash
-# Disk operations
-node src/yax.cjs disk info
-node src/yax.cjs disk list /
-node src/yax.cjs disk upload local.txt /remote.txt
-node src/yax.cjs disk download /remote.txt local.txt
+**Agent capabilities:**
+```javascript
+// Upload files
+exec("node /openclaw/skills/yax/src/yax.cjs disk upload local.txt /remote.txt")
 
-# Calendar operations
-node src/yax.cjs calendar list
-node src/yax.cjs calendar create "Meeting" "2026-02-14" "14:00:00" "15:00:00" "Description" "Europe/Moscow"
+// Download files
+exec("node /openclaw/skills/yax/src/yax.cjs disk download /remote.txt local.txt")
+
+// Create calendar events
+exec("node /openclaw/skills/yax/src/yax.cjs calendar create 'Meeting' '2026-02-14' '14:00:00' '15:00:00' 'Description' 'Europe/Moscow'")
+
+// List calendars
+exec("node /openclaw/skills/yax/src/yax.cjs calendar list")
 ```
 
-## Documentation
+## Agent Usage Examples
 
-Each skill has detailed documentation in its `SKILL.md` file:
+**Ask agent to use GigaChat:**
+> "Switch to GigaChat-Max and answer in Russian: Как дела?"
 
-- [GigaChat Documentation](./gigachat/SKILL.md)
-- [YandexGPT Documentation](./yandexgpt/SKILL.md)
-- [Yandex 360 Documentation](./yax/SKILL.md)
+**Ask agent to manage Yandex Disk:**
+> "Upload the article draft to Yandex Disk"
+
+**Ask agent to create calendar event:**
+> "Create a calendar event for tomorrow at 2pm: Team Meeting"
+
+**Create Russian-speaking subagent:**
+> "Spawn a subagent using GigaChat-Pro to proofread this text in Russian"
 
 ## Architecture
 
 ```
-OpenClaw
-  ├─→ GigaChat Proxy (port 8443) ─→ Sber GigaChat API
-  ├─→ YandexGPT Proxy (port 8444) ─→ Yandex Foundation Models API
-  └─→ yax CLI ─→ Yandex 360 APIs (Disk/Calendar)
+OpenClaw Agent
+  ├─→ GigaChat Proxy (localhost:8443) ─→ Sber API
+  ├─→ YandexGPT Proxy (localhost:8444) ─→ Yandex API
+  └─→ yax CLI ─→ Yandex 360 APIs
 ```
 
-All proxies translate OpenAI-format requests to native API formats, enabling drop-in compatibility with OpenClaw.
+All proxies run locally and translate OpenAI-format requests to native APIs.
 
 ## Security
 
-- ✅ OAuth tokens stored with 0600 permissions (owner-only)
-- ✅ Proxies bind to 127.0.0.1 (localhost only)
-- ✅ Token expiry checking with warnings
-- ✅ Input validation on file operations
-- ⚠️ GigaChat uses `-k` flag for SSL (Sber custom CA) - documented in scripts
-
-## Cross-Platform Support
-
-All skills work on **Linux** and **macOS**:
-- UUID generation: `uuidgen` → `/proc/sys/kernel/random/uuid` → Node.js fallback
-- Port cleanup: `fuser` (Linux) → `lsof` (macOS) fallback
-- PID files: standardized to `~/.openclaw/<skill>.pid`
+- ✅ Tokens stored with 0600 permissions
+- ✅ Proxies bind to 127.0.0.1 only
+- ✅ Token expiry checking
+- ✅ Cross-platform (Linux & macOS)
 
 ## Troubleshooting
 
-### GigaChat
+**GigaChat 401:** Token expired (30min) → Restart `start-proxy.sh`  
+**GigaChat 402:** Quota exhausted → Try different model  
+**YandexGPT 403:** Wrong folder ID → Check env file  
+**Yandex 360 token expired:** Run `yax auth device` again
 
-**401 Unauthorized:**
-- Token expired (30min lifespan)
-- Solution: Restart `./gigachat/scripts/start-proxy.sh`
+## Documentation
 
-**402 Payment Required:**
-- Quota exhausted for that model
-- Solution: Try different model (Max → Pro → Lite) or wait for quota reset
-
-### YandexGPT
-
-**403 Forbidden:**
-- Wrong `YANDEX_FOLDER_ID` in env file
-- Solution: Check folder ID in Yandex Cloud console
-
-### Yandex 360
-
-**Token expired:**
-- OAuth token lifespan varies (weeks to months)
-- Solution: Run `node src/yax.cjs auth` to refresh
-
-**Calendar timezone issues:**
-- 15 timezones supported (see `yax/src/yax.cjs` for full list)
-- Unknown timezones default to Europe/Moscow with warning
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-MIT License - see LICENSE file for details
+- [GigaChat SKILL.md](./gigachat/SKILL.md) - Detailed setup and troubleshooting
+- [YandexGPT SKILL.md](./yandexgpt/SKILL.md) - Proxy configuration
+- [Yandex 360 SKILL.md](./yax/SKILL.md) - CalDAV implementation details
 
 ## Links
 
 - **OpenClaw:** https://openclaw.ai
-- **Documentation:** https://docs.openclaw.ai
 - **GigaChat API:** https://developers.sber.ru/docs/ru/gigachat/overview
 - **YandexGPT API:** https://cloud.yandex.ru/docs/foundation-models/
-- **Yandex 360 API:** https://oauth.yandex.ru/
-
-## Credits
-
-Created for OpenClaw by [@smvlx](https://github.com/smvlx)
-
-Special thanks to:
-- Sber for GigaChat API
-- Yandex for Foundation Models and 360 APIs
-- OpenClaw community
+- **Yandex 360:** https://oauth.yandex.ru/
 
 ---
 
-**Need help?** Open an issue on GitHub or visit [OpenClaw Discord](https://discord.com/invite/clawd)
+**Created by [@smvlx](https://github.com/smvlx)** for OpenClaw agents
