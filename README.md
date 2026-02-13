@@ -155,11 +155,20 @@ openclaw gateway config.patch '{
 
 1. Create an OAuth app at [oauth.yandex.ru/client/new](https://oauth.yandex.ru/client/new)
 2. Set redirect URI: `https://oauth.yandex.ru/verification_code`
-3. Enable scopes:
-   - `cloud_api:disk.app_folder`
-   - `cloud_api:disk.info`
-   - `calendar:all`
-   - `telemost-api:conferences.create`
+3. Enable scopes for the services you need:
+
+   | Service | Scope | Enables |
+   |---------|-------|---------|
+   | **Disk** | `cloud_api:disk.app_folder` | App folder access |
+   | | `cloud_api:disk.info` | Disk info & quota |
+   | **Calendar** | `calendar:all` | Read/write calendar events |
+   | **Mail** | `mail:imap_full` | Read mail via IMAP |
+   | | `mail:smtp` | Send mail via SMTP |
+   | **Telemost** | `telemost-api:conferences.create` | Create video conferences |
+
+   > 💡 Select only the scopes you need. Most users need Disk + Calendar only.
+   >
+   > Full scope list: [yandex.ru/dev/id/doc/en/codes/scopes](https://yandex.ru/dev/id/doc/en/codes/scopes)
 4. Note **Client ID** (and Secret if applicable)
 5. Give credentials to your agent
 
