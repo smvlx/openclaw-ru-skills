@@ -17,7 +17,7 @@ fi
 # gpt2giga reads env vars from --env-path
 nohup gpt2giga \
   --env-path "$ENV_FILE" \
-  --proxy.host 0.0.0.0 \
+  --proxy.host 127.0.0.1 \
   --proxy.port 8443 \
   --proxy.pass-model true \
   --gigachat.verify-ssl-certs false \

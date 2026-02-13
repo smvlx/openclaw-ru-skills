@@ -28,13 +28,42 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-fuser -k $PORT/tcp 2>/dev/null || true
+# Cross-platform port cleanup
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k $PORT/tcp 2>/dev/null || true
+elif command -v lsof >/dev/null 2>&1; then
+  pid=$(lsof -ti :$PORT 2>/dev/null)
+  [ -n "$pid" ] && kill -9 $pid 2>/dev/null || true
+fi
 sleep 2
 
 # Generate access token
 echo "Generating GigaChat access token..."
-UUID=$(cat /proc/sys/kernel/random/uuid)
-TOKEN_RESPONSE=$(curl -s -k -X POST \
+
+# Cross-platform UUID generation
+if command -v uuidgen >/dev/null 2>&1; then
+  UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+elif [ -f /proc/sys/kernel/random/uuid ]; then
+  UUID=$(cat /proc/sys/kernel/random/uuid)
+else
+  UUID=$(node -e "console.log(crypto.randomUUID())" 2>/dev/null || echo "fallback-$(date +%s)-$$")
+fi
+
+# ⚠️  WARNING: SSL verification disabled (-k flag)
+# Sber uses a custom CA certificate that is not in standard CA bundles.
+# To enable SSL verification:
+# 1. Download Sber root CA from https://developers.sber.ru/
+# 2. Install to /etc/ssl/certs/sber-ca.crt
+# 3. Replace -k with --cacert /etc/ssl/certs/sber-ca.crt
+SBER_CA="/etc/ssl/certs/sber-ca.crt"
+if [ -f "$SBER_CA" ]; then
+  CURL_SSL_OPTS="--cacert $SBER_CA"
+else
+  echo "⚠️  WARNING: SSL verification disabled (-k flag). Sber CA not found at $SBER_CA"
+  CURL_SSL_OPTS="-k"
+fi
+
+TOKEN_RESPONSE=$(curl -s $CURL_SSL_OPTS -X POST \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -H "Accept: application/json" \
   -H "RqUID: $UUID" \
@@ -55,6 +84,7 @@ echo "Token obtained successfully (expires in ~30min)"
 # Start gpt2giga
 echo "Starting gpt2giga proxy on port $PORT..."
 gpt2giga \
+  --proxy.host 127.0.0.1 \
   --proxy.port $PORT \
   --proxy.pass-model true \
   --gigachat.access-token "$ACCESS_TOKEN" \

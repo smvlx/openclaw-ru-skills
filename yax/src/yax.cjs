@@ -26,7 +26,8 @@ function loadToken() {
   return null;
 }
 function saveToken(data) {
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2));
+  data.issued_at = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
 // --- HTTP helpers ---
