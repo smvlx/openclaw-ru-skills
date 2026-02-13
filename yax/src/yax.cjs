@@ -6,6 +6,34 @@ const path = require("path");
 const readline = require("readline");
 
 const TOKEN_FILE = path.join(process.env.HOME, ".openclaw/yax-token.json");
+
+// Timezone offset lookup (standard offsets, no DST)
+const TIMEZONE_OFFSETS = {
+  'Europe/Moscow': '+0300',
+  'Europe/Paris': '+0100',
+  'Europe/Berlin': '+0100',
+  'Europe/London': '+0000',
+  'America/New_York': '-0500',
+  'America/Chicago': '-0600',
+  'America/Denver': '-0700',
+  'America/Los_Angeles': '-0800',
+  'Asia/Tokyo': '+0900',
+  'Asia/Shanghai': '+0800',
+  'Asia/Kolkata': '+0530',
+  'Asia/Dubai': '+0400',
+  'Asia/Novosibirsk': '+0700',
+  'Asia/Yekaterinburg': '+0500',
+  'UTC': '+0000',
+};
+
+function getTzOffset(tz) {
+  const offset = TIMEZONE_OFFSETS[tz];
+  if (!offset) {
+    console.warn(`⚠️  Unknown timezone: ${tz}, defaulting to Europe/Moscow (+0300)`);
+    return '+0300';
+  }
+  return offset;
+}
 const CONFIG_FILE = path.join(process.env.HOME, ".openclaw/yax.env");
 
 // --- Env loading ---
@@ -167,6 +195,26 @@ function getToken() {
     console.error("Not authenticated. Run: yax auth");
     process.exit(1);
   }
+
+  // Check if token expired
+  const now = Math.floor(Date.now() / 1000);
+  const issued = t.issued_at || 0;
+  const expiresIn = t.expires_in || 31536000; // Default 1 year
+  const expiresAt = issued + expiresIn;
+
+  if (issued > 0 && now >= expiresAt) {
+    console.error("Token expired. Run: yax auth");
+    process.exit(1);
+  }
+
+  // Warn if expiring soon (< 7 days)
+  if (issued > 0) {
+    const daysLeft = Math.floor((expiresAt - now) / 86400);
+    if (daysLeft < 7) {
+      console.warn(`⚠️  Token expires in ${daysLeft} days. Consider refreshing: yax auth`);
+    }
+  }
+
   return t.access_token;
 }
 
@@ -360,6 +408,7 @@ async function calendarCreate(
   // Parse time properly
   const start = startTime.replace(/:/g, "");
   const end = endTime ? endTime.replace(/:/g, "") : start;
+  const tzOffset = getTzOffset(timezone);
 
   // Build ICS with timezone support
   const ics = [
@@ -371,8 +420,8 @@ async function calendarCreate(
     `TZID:${timezone}`,
     "BEGIN:STANDARD",
     "DTSTART:20260101T000000",
-    "TZOFFSETFROM:+0300",
-    "TZOFFSETTO:+0300",
+    `TZOFFSETFROM:${tzOffset}`,
+    `TZOFFSETTO:${tzOffset}`,
     "END:STANDARD",
     "END:VTIMEZONE",
     "BEGIN:VEVENT",
@@ -439,10 +488,22 @@ async function main() {
           case "ls":
             return diskList(args[0] || "/");
           case "mkdir":
+            if (!args[0]) {
+              console.error("Usage: yax disk mkdir <path>");
+              process.exit(1);
+            }
             return diskMkdir(args[0]);
           case "upload":
+            if (!args[0] || !args[1]) {
+              console.error("Usage: yax disk upload <local-file> <remote-path>");
+              process.exit(1);
+            }
             return diskUpload(args[0], args[1]);
           case "download":
+            if (!args[0] || !args[1]) {
+              console.error("Usage: yax disk download <remote-path> <local-file>");
+              process.exit(1);
+            }
             return diskDownload(args[0], args[1]);
           default:
             console.log("Usage: yax disk [info|list|mkdir|upload|download]");

@@ -2,7 +2,7 @@
 set -e
 
 ENV_FILE="${GIGACHAT_ENV_FILE:-$HOME/.openclaw/gigachat.env}"
-PID_FILE="/tmp/gpt2giga.pid"
+PID_FILE="$HOME/.openclaw/gigachat.pid"
 
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "gpt2giga already running (PID $(cat "$PID_FILE"))"

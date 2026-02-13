@@ -1,5 +1,5 @@
 #!/bin/bash
-PID_FILE="/tmp/gpt2giga.pid"
+PID_FILE="$HOME/.openclaw/gigachat.pid"
 if [ -f "$PID_FILE" ]; then
   kill "$(cat "$PID_FILE")" 2>/dev/null && echo "Stopped" || echo "Not running"
   rm -f "$PID_FILE"
