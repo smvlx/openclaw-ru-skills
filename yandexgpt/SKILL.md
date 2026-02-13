@@ -8,11 +8,11 @@ Runs a local HTTP proxy on port 8444 that accepts OpenAI-format API calls and tr
 
 ## Supported Models
 
-| Model | YandexGPT Model URI |
-|-------|-------------------|
-| yandexgpt | gpt://FOLDER_ID/yandexgpt/latest |
+| Model          | YandexGPT Model URI                   |
+| -------------- | ------------------------------------- |
+| yandexgpt      | gpt://FOLDER_ID/yandexgpt/latest      |
 | yandexgpt-lite | gpt://FOLDER_ID/yandexgpt-lite/latest |
-| yandexgpt-32k | gpt://FOLDER_ID/yandexgpt-32k/latest |
+| yandexgpt-32k  | gpt://FOLDER_ID/yandexgpt-32k/latest  |
 
 ## Setup
 

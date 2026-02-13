@@ -29,31 +29,31 @@ CLI tool for Yandex Disk, Calendar, and Mail via Yandex OAuth API.
 
 ```bash
 scripts/setup.sh        # Create env template
-node src/yax.js auth    # OAuth flow (opens browser URL, paste code)
+node src/yax.cjs auth   # OAuth flow (opens browser URL, paste code)
 ```
 
 ## Usage
 
 ```bash
 # Disk
-node src/yax.js disk info
-node src/yax.js disk list /
-node src/yax.js disk mkdir /test-folder
-node src/yax.js disk upload ./local-file.txt /remote-path.txt
-node src/yax.js disk download /remote-path.txt ./local-file.txt
+node src/yax.cjs disk info
+node src/yax.cjs disk list /
+node src/yax.cjs disk mkdir /test-folder
+node src/yax.cjs disk upload ./local-file.txt /remote-path.txt
+node src/yax.cjs disk download /remote-path.txt ./local-file.txt
 
 # Calendar
-node src/yax.js calendar list
-node src/yax.js calendar create "Meeting" "2024-12-25" "14:00:00" "Holiday meeting"
+node src/yax.cjs calendar list
+node src/yax.cjs calendar create "Meeting" "2026-02-14" "11:00:00" "12:00:00" "Holiday meeting" "Europe/Moscow"
 
 # Mail (informational only)
-node src/yax.js mail
+node src/yax.cjs mail
 ```
 
-## Limitations
+## Implementation Details
 
+- **Calendar**: Uses raw CalDAV HTTP requests to `caldav.yandex.ru`. Automatically discovers user login via OAuth info endpoint and calendar paths via PROPFIND. Supports timezone-aware event creation. No external dependencies.
 - **Mail**: Yandex does not offer a public REST/HTTP API for mail operations. Only IMAP/SMTP is available, which requires direct TCP connections on ports 993/465 — typically blocked in cloud environments (Railway, etc.). The Yandex 360 Admin API exists for organization accounts but is not suitable for personal use.
-- **Calendar**: Uses raw CalDAV HTTP requests to `caldav.yandex.ru`. No external dependencies.
 
 ## Scripts
 
