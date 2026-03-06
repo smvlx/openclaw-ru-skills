@@ -1,7 +1,8 @@
 ---
 name: gigachat
 description: Integrate GigaChat (Sber AI) with OpenClaw via gpt2giga proxy
-version: 1.0.0
+version: 1.1.0
+metadata: {"openclaw":{"emoji":"🤖","homepage":"https://github.com/smvlx/openclaw-ru-skills","os":["darwin","linux"],"requires":{"bins":["python3","curl","jq"],"env":["GIGACHAT_CREDENTIALS","GIGACHAT_SCOPE"]},"primaryEnv":"GIGACHAT_CREDENTIALS","configPaths":["~/.openclaw/gigachat-new.env","~/.openclaw/openclaw.json"]}}
 ---
 
 # GigaChat Skill

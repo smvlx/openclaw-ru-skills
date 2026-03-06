@@ -19,7 +19,22 @@ Talk to your agent in natural language — it handles the rest:
 
 ## Installation
 
-### Option 1: Install script (recommended)
+### Option 1: ClawHub (recommended)
+
+Install each skill individually from ClawHub:
+
+```bash
+clawhub install smvlx/sber-gigachat
+clawhub install smvlx/yandex-gpt
+clawhub install smvlx/yandex-cli-yax
+```
+
+Or browse on ClawHub:
+- [smvlx/sber-gigachat](https://clawhub.ai/smvlx/sber-gigachat)
+- [smvlx/yandex-gpt](https://clawhub.ai/smvlx/yandex-gpt)
+- [smvlx/yandex-cli-yax](https://clawhub.ai/smvlx/yandex-cli-yax)
+
+### Option 2: Install script
 
 ```bash
 git clone https://github.com/smvlx/openclaw-ru-skills.git /tmp/openclaw-ru-skills
@@ -28,7 +43,7 @@ git clone https://github.com/smvlx/openclaw-ru-skills.git /tmp/openclaw-ru-skill
 
 This copies each skill into `~/.openclaw/skills/` and installs dependencies.
 
-### Option 2: Manual install
+### Option 3: Manual install
 
 ```bash
 git clone https://github.com/smvlx/openclaw-ru-skills.git
@@ -38,15 +53,13 @@ cp -r openclaw-ru-skills/yax ~/.openclaw/skills/
 cd ~/.openclaw/skills/yax && npm install --omit=dev
 ```
 
-### Option 3: Chat-based install
+### Option 4: Chat-based install
 
 Paste the repo URL into your OpenClaw conversation:
 
 > Install skills from https://github.com/smvlx/openclaw-ru-skills
 
 The agent will handle cloning and setup.
-
-> **Note:** The `openclaw skills add <url>` CLI command is [not yet merged](https://github.com/openclaw/openclaw/pull/21523) into OpenClaw (as of 2026.2.17). Use one of the methods above instead.
 
 ---
 

@@ -75,7 +75,8 @@ ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
 
 if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
   echo "Error: Failed to get access token"
-  echo "$TOKEN_RESPONSE"
+  # Show error message from response without exposing raw token/credentials
+  echo "$TOKEN_RESPONSE" | jq -r '.error // .message // "Unknown error (check credentials and network)"' 2>/dev/null || echo "Unknown error (check credentials and network)"
   exit 1
 fi
 
