@@ -336,7 +336,7 @@ async function getUserLogin() {
   return data.login;
 }
 
-// Discover calendars for the user
+// Discover calendars for the user (raw PROPFIND multistatus XML)
 async function discoverCalendars(login) {
   const token = getToken();
   const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -349,7 +349,7 @@ async function discoverCalendars(login) {
   const res = await request(
     {
       hostname: "caldav.yandex.ru",
-      path: `/calendars/${login}@yandex.ru/`,
+      path: calendarPath(login),
       method: "PROPFIND",
       headers: {
         Authorization: `OAuth ${token}`,
@@ -361,6 +361,238 @@ async function discoverCalendars(login) {
     body,
   );
   return res.body.toString();
+}
+
+// Build a CalDAV path. Every segment is URL-encoded so UIDs containing
+// spaces, '#', '?' or non-ASCII characters are addressed correctly.
+function calendarPath(login, calendarId, uid) {
+  let p = `/calendars/${encodeURIComponent(login + "@yandex.ru")}/`;
+  if (calendarId) p += `${encodeURIComponent(calendarId)}/`;
+  if (uid) p += encodeURIComponent(uid + ".ics");
+  return p;
+}
+
+// All `events-N` calendar ids for the user, in discovery order.
+async function findEventsCalendars(login) {
+  const xml = await discoverCalendars(login);
+  const ids = [...xml.matchAll(/\/calendars\/[^\/]+\/(events-\d+)\//g)].map((m) => m[1]);
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) {
+    console.error("No events calendar found");
+    process.exitCode = 1;
+  }
+  return unique;
+}
+
+function caldavRequest(method, path, token, body, extraHeaders = {}) {
+  const headers = { Authorization: `OAuth ${token}`, ...extraHeaders };
+  if (body) headers["Content-Length"] = Buffer.byteLength(body);
+  return request({ hostname: "caldav.yandex.ru", path, method, headers }, body);
+}
+
+// --- iCalendar helpers ---
+
+// Unfold RFC 5545 content lines; accepts CRLF or bare LF input.
+function icsLines(body) {
+  const lines = [];
+  for (const raw of body.split(/\r?\n/)) {
+    if ((raw.startsWith(" ") || raw.startsWith("\t")) && lines.length) {
+      lines[lines.length - 1] += raw.slice(1);
+    } else if (raw.length) {
+      lines.push(raw);
+    }
+  }
+  return lines;
+}
+
+// "DTSTART;TZID=Europe/Moscow:20260214T110000" -> { name, params, value }
+function icsProp(line) {
+  const colon = line.search(/:(?=(?:[^"]*"[^"]*")*[^"]*$)/); // first ':' outside quotes
+  if (colon < 0) return null;
+  const [name, ...params] = line.slice(0, colon).split(";");
+  return { name: name.toUpperCase(), params: params.join(";"), value: line.slice(colon + 1) };
+}
+
+function icsUnescape(text) {
+  return text.replace(/\\([\;,nN])/g, (_, c) => (c === "n" || c === "N" ? "\n" : c));
+}
+
+function icsEscape(text) {
+  return String(text).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+}
+
+// Format a DATE / DATE-TIME value for display. Handles TZID, UTC ("Z") and all-day values.
+function formatIcsDate(prop) {
+  if (!prop) return "";
+  const v = prop.value.trim();
+  const d = `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
+  if (v.length === 8) return `${d} (all day)`;
+  const t = `${v.slice(9, 11)}:${v.slice(11, 13)}`;
+  return v.endsWith("Z") ? `${d} ${t}Z` : `${d} ${t}`;
+}
+
+// Properties of the master VEVENT (the one without RECURRENCE-ID), as a map of name -> prop.
+function icsMasterEvent(body) {
+  const lines = icsLines(body);
+  let inEvent = false;
+  let props = {};
+  for (const line of lines) {
+    const p = icsProp(line);
+    if (!p) continue;
+    if (p.name === "BEGIN" && p.value.toUpperCase() === "VEVENT") {
+      inEvent = true;
+      props = {};
+    } else if (p.name === "END" && p.value.toUpperCase() === "VEVENT") {
+      inEvent = false;
+      if (!props["RECURRENCE-ID"]) return props;
+    } else if (inEvent && !props[p.name]) {
+      props[p.name] = p;
+    }
+  }
+  return null;
+}
+
+function icsTimezoneBlock(timezone) {
+  const tzOffset = getTzOffset(timezone);
+  return [
+    "BEGIN:VTIMEZONE",
+    `TZID:${timezone}`,
+    "BEGIN:STANDARD",
+    "DTSTART:20260101T000000",
+    `TZOFFSETFROM:${tzOffset}`,
+    `TZOFFSETTO:${tzOffset}`,
+    "END:STANDARD",
+    "END:VTIMEZONE",
+  ];
+}
+
+function icsStamp(d = new Date()) {
+  return d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+function icsDateTime(date, time) {
+  return `${date.replace(/-/g, "")}T${time.replace(/:/g, "")}`;
+}
+
+// Build a complete VCALENDAR with a single VEVENT.
+function buildIcs({ uid, summary, date, startTime, endTime, description, timezone }) {
+  const start = icsDateTime(date, startTime);
+  const end = icsDateTime(date, endTime || startTime);
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//yax//openclaw//EN",
+    "CALSCALE:GREGORIAN",
+    ...icsTimezoneBlock(timezone),
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    `DTSTAMP:${icsStamp()}`,
+    `DTSTART;TZID=${timezone}:${start}`,
+    `DTEND;TZID=${timezone}:${end}`,
+    `SUMMARY:${icsEscape(summary)}`,
+    description ? `DESCRIPTION:${icsEscape(description)}` : "",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ]
+    .filter(Boolean)
+    .join("\r\n");
+}
+
+// Rewrite only the master VEVENT of an existing calendar object: replace the
+// date/time, summary (and description if given), bump SEQUENCE, refresh
+// DTSTAMP/LAST-MODIFIED, and keep every other property (RRULE, ATTENDEE,
+// ORGANIZER, VALARM, LOCATION, ...) and every other component untouched.
+function updateIcs(body, { summary, date, startTime, endTime, description, timezone }) {
+  const lines = icsLines(body);
+  const out = [];
+  let inEvent = false;
+  let isMaster = false;
+  let done = false;
+  let hasTz = false;
+  let seq = 0;
+  const drop = new Set(["DTSTART", "DTEND", "DURATION", "SUMMARY", "SEQUENCE", "DTSTAMP", "LAST-MODIFIED"]);
+  if (description !== undefined) drop.add("DESCRIPTION");
+
+  // Determine whether the first VEVENT without RECURRENCE-ID exists and whether the TZ is defined.
+  let eventIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const p = icsProp(lines[i]);
+    if (!p) continue;
+    if (p.name === "TZID" && p.value.trim() === timezone) hasTz = true;
+    if (p.name === "BEGIN" && p.value.toUpperCase() === "VEVENT" && eventIdx < 0) {
+      let j = i + 1;
+      let recurrence = false;
+      for (; j < lines.length; j++) {
+        const q = icsProp(lines[j]);
+        if (!q) continue;
+        if (q.name === "END" && q.value.toUpperCase() === "VEVENT") break;
+        if (q.name === "RECURRENCE-ID") recurrence = true;
+        if (q.name === "SEQUENCE") seq = parseInt(q.value, 10) || 0;
+      }
+      if (!recurrence) eventIdx = i;
+    }
+  }
+  if (eventIdx < 0) return null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const p = icsProp(line);
+    if (p && p.name === "BEGIN" && p.value.toUpperCase() === "VEVENT") {
+      if (i === eventIdx) {
+        inEvent = true;
+        isMaster = true;
+        if (!hasTz) out.push(...icsTimezoneBlock(timezone));
+      }
+      out.push(line);
+      continue;
+    }
+    if (p && p.name === "END" && p.value.toUpperCase() === "VEVENT" && inEvent) {
+      if (isMaster && !done) {
+        out.push(
+          `DTSTAMP:${icsStamp()}`,
+          `LAST-MODIFIED:${icsStamp()}`,
+          `SEQUENCE:${seq + 1}`,
+          `DTSTART;TZID=${timezone}:${icsDateTime(date, startTime)}`,
+          `DTEND;TZID=${timezone}:${icsDateTime(date, endTime || startTime)}`,
+          `SUMMARY:${icsEscape(summary)}`,
+        );
+        if (description) out.push(`DESCRIPTION:${icsEscape(description)}`);
+        done = true;
+      }
+      inEvent = false;
+      isMaster = false;
+      out.push(line);
+      continue;
+    }
+    if (inEvent && isMaster && p && drop.has(p.name)) continue;
+    out.push(line);
+  }
+  return out.join("\r\n") + "\r\n";
+}
+
+// Locate the calendar that holds `uid`. Returns { calendarId, etag, body } or null.
+async function findEvent(login, uid) {
+  const token = getToken();
+  for (const calendarId of await findEventsCalendars(login)) {
+    const res = await caldavRequest("GET", calendarPath(login, calendarId, uid), token);
+    if (res.status === 200) {
+      return { calendarId, etag: res.headers.etag, body: res.body.toString() };
+    }
+    if (res.status !== 404) {
+      console.error(`❌ GET ${calendarId}/${uid}.ics: status ${res.status}`);
+    }
+  }
+  return null;
+}
+
+function xmlUnescape(s) {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, "&");
 }
 
 async function calendarList() {
@@ -392,257 +624,189 @@ async function calendarCreate(
   timezone = "Europe/Moscow",
 ) {
   const login = await getUserLogin();
-  const xml = await discoverCalendars(login);
-
-  // Find first events calendar
-  const match = xml.match(/\/calendars\/[^\/]+\/(events-\d+)\//);
-  if (!match) {
-    console.error("No events calendar found");
-    return;
-  }
-  const calendarId = match[1];
+  const [calendarId] = await findEventsCalendars(login);
+  if (!calendarId) return;
 
   const token = getToken();
   const uid = `yax-${Date.now()}@openclaw`;
+  const ics = buildIcs({ uid, summary, date, startTime, endTime, description, timezone });
 
-  // Parse time properly
-  const start = startTime.replace(/:/g, "");
-  const end = endTime ? endTime.replace(/:/g, "") : start;
-  const tzOffset = getTzOffset(timezone);
-
-  // Build ICS with timezone support
-  const ics = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//yax//openclaw//EN",
-    "CALSCALE:GREGORIAN",
-    "BEGIN:VTIMEZONE",
-    `TZID:${timezone}`,
-    "BEGIN:STANDARD",
-    "DTSTART:20260101T000000",
-    `TZOFFSETFROM:${tzOffset}`,
-    `TZOFFSETTO:${tzOffset}`,
-    "END:STANDARD",
-    "END:VTIMEZONE",
-    "BEGIN:VEVENT",
-    `UID:${uid}`,
-    `DTSTART;TZID=${timezone}:${date.replace(/-/g, "")}T${start}`,
-    `DTEND;TZID=${timezone}:${date.replace(/-/g, "")}T${end}`,
-    `SUMMARY:${summary}`,
-    description ? `DESCRIPTION:${description}` : "",
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ]
-    .filter(Boolean)
-    .join("\r\n");
-
-  const path = `/calendars/${login}@yandex.ru/${calendarId}/${uid}.ics`;
-  const res = await request(
-    {
-      hostname: "caldav.yandex.ru",
-      path: path,
-      method: "PUT",
-      headers: {
-        Authorization: `OAuth ${token}`,
-        "Content-Type": "text/calendar; charset=utf-8",
-        "Content-Length": Buffer.byteLength(ics),
-      },
-    },
-    ics,
-  );
+  const res = await caldavRequest("PUT", calendarPath(login, calendarId, uid), token, ics, {
+    "Content-Type": "text/calendar; charset=utf-8",
+    "If-None-Match": "*",
+  });
 
   if (res.status === 201) {
-    console.log(`✅ Created event: ${summary} at ${startTime}`);
+    console.log(`✅ Created event: ${summary} at ${startTime} (UID: ${uid})`);
   } else {
     console.log(`❌ Status: ${res.status}`);
     console.log(res.body.toString().substring(0, 500));
+    process.exitCode = 1;
   }
 }
 
-// List events in the primary events calendar
-async function calendarListEvents() {
-  const login = await getUserLogin();
-  const xml = await discoverCalendars(login);
-
-  const match = xml.match(/\/calendars\/[^\/]+\/(events-\d+)\//);
-  if (!match) {
-    console.error("No events calendar found");
-    return;
-  }
-  const calendarId = match[1];
-
-  const token = getToken();
+// Fetch all events of one calendar in a single REPORT (calendar-query with calendar-data).
+// Returns an array of ICS bodies, or null if the server does not support the REPORT.
+async function reportCalendarEvents(login, calendarId, token) {
   const body = `<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/">
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop>
     <d:getetag/>
-    <a:calendarcolor/>
+    <c:calendar-data/>
   </d:prop>
-</d:propfind>`;
-
-  const res = await request(
-    {
-      hostname: "caldav.yandex.ru",
-      path: `/calendars/${login}@yandex.ru/${calendarId}/`,
-      method: "PROPFIND",
-      headers: {
-        Authorization: `OAuth ${token}`,
-        "Content-Type": "application/xml",
-        Depth: "1",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    },
-    body,
-  );
-
-  const xmlBody = res.body.toString();
-  // Parse UIDs from hrefs
-  const hrefRegex = /<href[^>]*>([^<]+\.ics)<\/href>/gi;
-  const matches = [...xmlBody.matchAll(hrefRegex)];
-
-  if (matches.length === 0) {
-    console.log("No events found");
-    return;
-  }
-
-  // Fetch each .ics to get summary and time
-  for (const m of matches) {
-    const icsPath = decodeURIComponent(m[1]);
-    const uid = icsPath.replace(/.*\//, "").replace("\.ics", "");
-    const icsRes = await request({
-      hostname: "caldav.yandex.ru",
-      path: `/calendars/${encodeURIComponent(login + '@yandex.ru')}/${calendarId}/${encodeURIComponent(uid + '.ics')}`,
-      method: "GET",
-      headers: { Authorization: `OAuth ${token}` },
-    });
-    const icsBody = icsRes.body.toString();
-    const summaryIdx = icsBody.indexOf('SUMMARY:');
-    const summary = summaryIdx >= 0 ? icsBody.slice(summaryIdx + 8, icsBody.indexOf('\r\n', summaryIdx)).trim() : '(no title)';
-    const dtstartIdx = icsBody.indexOf('DTSTART;TZID=');
-    const dtstart = dtstartIdx >= 0 ? icsBody.slice(dtstartIdx + 12, icsBody.indexOf('\r\n', dtstartIdx)).trim() : '';
-    const dateStr = dtstart ? `${dtstart.slice(0, 4)}-${dtstart.slice(4, 6)}-${dtstart.slice(6, 8)} ${dtstart.slice(9, 11)}:${dtstart.slice(11, 13)}` : "";
-    console.log(`${dateStr} | ${summary} | UID: ${uid}`);
-  }
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>`;
+  const res = await caldavRequest("REPORT", calendarPath(login, calendarId), token, body, {
+    "Content-Type": "application/xml; charset=utf-8",
+    Depth: "1",
+  });
+  if (res.status !== 207) return null;
+  const xml = res.body.toString();
+  const dataRegex = /<(?:[\w-]+:)?calendar-data[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?calendar-data>/gi;
+  return [...xml.matchAll(dataRegex)].map((m) => xmlUnescape(m[1]));
 }
 
-// Update an existing event by UID
+// Fallback for servers without calendar-query: PROPFIND hrefs, then GET each object.
+async function fetchCalendarEventsIndividually(login, calendarId, token) {
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>`;
+  const res = await caldavRequest("PROPFIND", calendarPath(login, calendarId), token, body, {
+    "Content-Type": "application/xml",
+    Depth: "1",
+  });
+  const hrefs = [...res.body.toString().matchAll(/<(?:[\w-]+:)?href[^>]*>([^<]+\.ics)<\/(?:[\w-]+:)?href>/gi)];
+  const bodies = [];
+  for (const m of hrefs) {
+    let href = xmlUnescape(m[1]);
+    if (/^https?:\/\//i.test(href)) {
+      const u = new URL(href);
+      href = u.pathname + u.search;
+    }
+    const icsRes = await caldavRequest("GET", href, token);
+    if (icsRes.status === 200) bodies.push(icsRes.body.toString());
+  }
+  return bodies;
+}
+
+// List events in every events calendar
+async function calendarListEvents() {
+  const login = await getUserLogin();
+  const token = getToken();
+  const calendars = await findEventsCalendars(login);
+  let total = 0;
+
+  for (const calendarId of calendars) {
+    let bodies = await reportCalendarEvents(login, calendarId, token);
+    if (bodies === null) bodies = await fetchCalendarEventsIndividually(login, calendarId, token);
+
+    const rows = [];
+    for (const body of bodies) {
+      const ev = icsMasterEvent(body);
+      if (!ev || !ev.UID) continue;
+      const summary = ev.SUMMARY ? icsUnescape(ev.SUMMARY.value).trim() : "(no title)";
+      const recurring = ev.RRULE ? " 🔁" : "";
+      rows.push({ date: formatIcsDate(ev.DTSTART), text: `${summary}${recurring} | UID: ${ev.UID.value.trim()}` });
+    }
+    rows.sort((a, b) => a.date.localeCompare(b.date));
+    if (calendars.length > 1) console.log(`📅 ${calendarId}`);
+    for (const r of rows) console.log(`${r.date} | ${r.text}`);
+    total += rows.length;
+  }
+  if (total === 0 && calendars.length) console.log("No events found");
+}
+
+// Update an existing event by UID, preserving all properties we do not manage.
 async function calendarUpdate(uid, newSummary, newDate, newStartTime, newEndTime, newDescription, timezone = "Europe/Moscow") {
   const login = await getUserLogin();
-  const xml = await discoverCalendars(login);
-
-  const match = xml.match(/\/calendars\/[^\/]+\/(events-\d+)\//);
-  if (!match) {
-    console.error("No events calendar found");
-    return;
-  }
-  const calendarId = match[1];
-
   const token = getToken();
-
-  // Fetch existing event to preserve fields
-  const icsRes = await request({
-    hostname: "caldav.yandex.ru",
-    path: `/calendars/${login}@yandex.ru/${calendarId}/${uid}.ics`,
-    method: "GET",
-    headers: { Authorization: `OAuth ${token}` },
-  });
-
-  if (icsRes.status === 404) {
+  const found = await findEvent(login, uid);
+  if (!found) {
     console.error(`Event not found: ${uid}`);
+    process.exitCode = 1;
     return;
   }
 
-  const start = newStartTime.replace(/:/g, "");
-  const end = newEndTime ? newEndTime.replace(/:/g, "") : start;
-  const tzOffset = getTzOffset(timezone);
+  const ics = updateIcs(found.body, {
+    summary: newSummary,
+    date: newDate,
+    startTime: newStartTime,
+    endTime: newEndTime,
+    description: newDescription,
+    timezone,
+  });
+  if (!ics) {
+    console.error(`❌ No VEVENT found in ${uid}.ics`);
+    process.exitCode = 1;
+    return;
+  }
 
-  const ics = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//yax//openclaw//EN",
-    "CALSCALE:GREGORIAN",
-    "BEGIN:VTIMEZONE",
-    `TZID:${timezone}`,
-    "BEGIN:STANDARD",
-    "DTSTART:20260101T000000",
-    `TZOFFSETFROM:${tzOffset}`,
-    `TZOFFSETTO:${tzOffset}`,
-    "END:STANDARD",
-    "END:VTIMEZONE",
-    "BEGIN:VEVENT",
-    `UID:${uid}`,
-    `DTSTART;TZID=${timezone}:${newDate.replace(/-/g, "")}T${start}`,
-    `DTEND;TZID=${timezone}:${newDate.replace(/-/g, "")}T${end}`,
-    `SUMMARY:${newSummary}`,
-    newDescription ? `DESCRIPTION:${newDescription}` : "",
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ]
-    .filter(Boolean)
-    .join("\r\n");
-
-  const path = `/calendars/${login}@yandex.ru/${calendarId}/${uid}.ics`;
-  const putRes = await request(
-    {
-      hostname: "caldav.yandex.ru",
-      path: path,
-      method: "PUT",
-      headers: {
-        Authorization: `OAuth ${token}`,
-        "Content-Type": "text/calendar; charset=utf-8",
-        "Content-Length": Buffer.byteLength(ics),
-      },
-    },
-    ics,
-  );
+  const headers = { "Content-Type": "text/calendar; charset=utf-8" };
+  if (found.etag) headers["If-Match"] = found.etag;
+  const putRes = await caldavRequest("PUT", calendarPath(login, found.calendarId, uid), token, ics, headers);
 
   if (putRes.status === 200 || putRes.status === 201 || putRes.status === 204) {
     console.log(`✅ Updated event: ${newSummary}`);
+  } else if (putRes.status === 412) {
+    console.error("❌ Event was modified by another client meanwhile. Re-run the update.");
+    process.exitCode = 1;
   } else {
     console.log(`❌ Status: ${putRes.status}`);
+    console.log(putRes.body.toString().substring(0, 500));
+    process.exitCode = 1;
   }
 }
 
 // Delete an event by UID
 async function calendarDelete(uid) {
   const login = await getUserLogin();
-  const xml = await discoverCalendars(login);
-
-  const match = xml.match(/\/calendars\/[^\/]+\/(events-\d+)\//);
-  if (!match) {
-    console.error("No events calendar found");
+  const token = getToken();
+  const found = await findEvent(login, uid);
+  if (!found) {
+    console.error(`Event not found: ${uid}`);
+    process.exitCode = 1;
     return;
   }
-  const calendarId = match[1];
 
-  const token = getToken();
-  const path = `/calendars/${login}@yandex.ru/${calendarId}/${uid}.ics`;
-  const res = await request(
-    {
-      hostname: "caldav.yandex.ru",
-      path: path,
-      method: "DELETE",
-      headers: { Authorization: `OAuth ${token}` },
-    },
-  );
+  const headers = {};
+  if (found.etag) headers["If-Match"] = found.etag;
+  const res = await caldavRequest("DELETE", calendarPath(login, found.calendarId, uid), token, undefined, headers);
 
-  if (res.status === 200 || res.status === 204 || res.status === 404) {
+  if (res.status === 200 || res.status === 204) {
     console.log(`✅ Deleted event: ${uid}`);
+  } else if (res.status === 404) {
+    console.error(`Event not found: ${uid}`);
+    process.exitCode = 1;
   } else {
     console.log(`❌ Status: ${res.status}`);
+    process.exitCode = 1;
   }
 }
 
 // --- Mail ---
-// Yandex doesn't have a public HTTP API for mail (only IMAP/SMTP).
-// We document this as a limitation. Below is a stub.
+// Yandex has no public HTTP API for mail, so IMAP/SMTP are handled by mail.py
+// (Python 3 stdlib). The child's exit code is propagated so callers can rely on it.
 function mailMain() {
   const { spawn } = require("child_process");
-  const path = require("path");
   const script = path.join(__dirname, "mail.py");
   const args = process.argv.slice(3); // yax mail <subcommand> <args>
-  const child = spawn("python3", [script, ...args], { stdio: "inherit" });
-  child.on("error", (e) => console.error("Mail error:", e.message));
+  return new Promise((resolve) => {
+    const child = spawn("python3", [script, ...args], { stdio: "inherit" });
+    child.on("error", (e) => {
+      console.error("Mail error:", e.message);
+      if (e.code === "ENOENT") console.error("python3 is required for `yax mail` commands. Install Python 3 and retry.");
+      process.exitCode = 1;
+      resolve();
+    });
+    child.on("close", (code, signal) => {
+      process.exitCode = code === 0 ? 0 : code > 0 ? code : 1;
+      if (signal) console.error(`mail.py terminated by ${signal}`);
+      resolve();
+    });
+  });
 }
 
 // --- CLI ---
@@ -738,18 +902,29 @@ Commands:
   disk upload <local> <remote>   Upload file
   disk download <remote> <local> Download file
   calendar list           List calendars
+  calendar list-events    List events (date, title, UID) in all events calendars
   calendar create <summary> <YYYY-MM-DD> <HH:MM:SS> [HH:MM:SS] [desc] [tz]  Create event
-  mail list [folder] [n]    List recent emails (default: INBOX, last 10)
+  calendar update <uid> <summary> <YYYY-MM-DD> <HH:MM:SS> [HH:MM:SS] [desc] [tz]  Update event
+  calendar delete <uid>   Delete event by UID
+  mail folders             List all mail folders
+  mail list [folder] [n]   List recent emails (default: INBOX, last 10)
   mail read <uid> [folder] Read email by UID
   mail delete <uid> [folder] Delete email by UID
-  mail folders             List all mail folders
+  mail send <to> <subject> <body>  Send email via SMTP
   mail attachments <uid> [folder]  List attachments in email
   mail download <uid> <name> [folder] [dir]  Download one attachment
-  mail download_all <uid> [folder] [dir]  Download all attachments`);
+  mail download_all <uid> [folder] [dir]  Download all attachments (default dir: ./attachments)
+
+Mail commands require python3 (stdlib only).`);
     }
   } catch (e) {
     console.error("Error:", e.message);
+    process.exitCode = 1;
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+} else {
+  module.exports = { icsLines, icsProp, icsMasterEvent, formatIcsDate, buildIcs, updateIcs, calendarPath, xmlUnescape };
+}
