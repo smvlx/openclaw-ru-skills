@@ -3,9 +3,19 @@ const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const readline = require("readline");
 
 const TOKEN_FILE = path.join(process.env.HOME, ".openclaw/yax-token.json");
+const SYNC_STATE_DIR = path.join(process.env.HOME, ".openclaw/yax-sync");
+
+// Per-file upload cap: 1 GB on a free account, 50 GB with Yandex 360.
+const MAX_FILE_BYTES = 50 * 1024 ** 3;
+// Never worth syncing: rebuilt by a package manager or a build, not by you.
+const SYNC_SKIP = [
+  "node_modules", ".venv", "venv", "__pycache__", ".git",
+  ".next", ".cache", ".pytest_cache", ".DS_Store", "*.pyc",
+];
 
 // Timezone offset lookup (standard offsets, no DST)
 const TIMEZONE_OFFSETS = {
@@ -255,8 +265,44 @@ async function diskMkdir(p) {
   console.log(res.status === 201 ? `Created: ${p}` : JSON.parse(res.body.toString()));
 }
 
-async function diskUpload(localPath, remotePath) {
-  const token = getToken();
+// Streams the body instead of buffering it: a 1.3 GB file must not become a
+// 1.3 GB Buffer just to be PUT.
+function putStream(href, localPath, size, token) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(href);
+    const mod = url.protocol === "http:" ? http : https;
+    const req = mod.request(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: "PUT",
+        headers: { Authorization: `OAuth ${token}`, "Content-Length": size },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode, body: Buffer.concat(chunks) }),
+        );
+      },
+    );
+    req.on("error", reject);
+    const stream = fs.createReadStream(localPath);
+    stream.on("error", (err) => {
+      req.destroy();
+      reject(err);
+    });
+    stream.pipe(req);
+  });
+}
+
+async function uploadOne(localPath, remotePath, token) {
+  const size = fs.statSync(localPath).size;
+  if (size > MAX_FILE_BYTES) {
+    throw new Error(
+      `${formatBytes(size)} exceeds the ${formatBytes(MAX_FILE_BYTES)} per-file limit`,
+    );
+  }
   const res = await apiRequest(
     "GET",
     "cloud-api.yandex.net",
@@ -265,25 +311,25 @@ async function diskUpload(localPath, remotePath) {
   );
   const data = JSON.parse(res.body.toString());
   if (!data.href) {
-    console.error("Upload URL error:", data);
-    return;
+    const hint =
+      data.error === "ForbiddenError"
+        ? " — the OAuth app is missing scope cloud_api:disk.write; add it and re-run `yax auth`"
+        : "";
+    throw new Error(`upload URL: ${JSON.stringify(data)}${hint}`);
   }
+  const uploadRes = await putStream(data.href, localPath, size, token);
+  if (uploadRes.status !== 201 && uploadRes.status !== 202) {
+    throw new Error(
+      `PUT ${remotePath}: HTTP ${uploadRes.status} ${uploadRes.body.toString().slice(0, 200)}`,
+    );
+  }
+  return size;
+}
 
-  const url = new URL(data.href);
-  const fileData = fs.readFileSync(localPath);
-  const uploadRes = await request(
-    {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      method: "PUT",
-      headers: {
-        Authorization: `OAuth ${token}`,
-        "Content-Length": fileData.length,
-      },
-    },
-    fileData,
-  );
-  console.log(uploadRes.status === 201 ? `Uploaded: ${remotePath}` : `Status: ${uploadRes.status}`);
+async function diskUpload(localPath, remotePath) {
+  const token = getToken();
+  await uploadOne(localPath, remotePath, token);
+  console.log(`Uploaded: ${remotePath}`);
 }
 
 async function diskDownload(remotePath, localPath) {
@@ -320,6 +366,222 @@ async function diskDownload(remotePath, localPath) {
     fs.writeFileSync(localPath, dlRes.body);
   }
   console.log(`Downloaded to: ${localPath}`);
+}
+
+// --- Disk sync ---
+function formatBytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i += 1;
+  }
+  return `${n.toFixed(1)}${units[i]}`;
+}
+
+function fileMd5(p) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("md5");
+    const stream = fs.createReadStream(p);
+    stream.on("error", reject);
+    stream.on("data", (c) => hash.update(c));
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+// Retries only what is worth retrying: a 4xx will not fix itself.
+async function withRetries(fn, what, attempts = 5) {
+  let delay = 2000;
+  for (let i = 1; ; i += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = e.status || 0;
+      const retryable = status >= 500 || status === 429 || status === 0;
+      if (!retryable || i >= attempts) throw e;
+      console.log(`    retry ${i}/${attempts - 1} — ${what}: ${e.message}`);
+      await new Promise((r) => setTimeout(r, delay));
+      delay *= 2;
+    }
+  }
+}
+
+async function diskStat(remotePath, token) {
+  const res = await apiRequest(
+    "GET",
+    "cloud-api.yandex.net",
+    `/v1/disk/resources?path=${encodeURIComponent(remotePath)}&fields=md5,size,type`,
+    token,
+  );
+  if (res.status === 404) return null;
+  if (res.status !== 200) {
+    const err = new Error(`stat ${remotePath}: HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return JSON.parse(res.body.toString());
+}
+
+async function ensureRemoteDir(remotePath, token, made) {
+  if (!remotePath || remotePath === "/" || made.has(remotePath)) return;
+  const parent = path.posix.dirname(remotePath);
+  if (parent && parent !== "/" && parent !== remotePath) {
+    await ensureRemoteDir(parent, token, made);
+  }
+  const res = await apiRequest(
+    "PUT",
+    "cloud-api.yandex.net",
+    `/v1/disk/resources?path=${encodeURIComponent(remotePath)}`,
+    token,
+  );
+  // 409 is the documented "already exists", which is success for our purposes.
+  if (res.status !== 201 && res.status !== 409) {
+    const err = new Error(`mkdir ${remotePath}: HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  made.add(remotePath);
+}
+
+function skipName(name, extra) {
+  return [...SYNC_SKIP, ...extra].some((pattern) =>
+    pattern.includes("*")
+      ? new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(name)
+      : name === pattern,
+  );
+}
+
+function walkTree(root, extra) {
+  const out = [];
+  const visit = (dir, rel) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      if (skipName(entry.name, extra)) continue;
+      const full = path.join(dir, entry.name);
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) continue; // a symlink's target is synced on its own
+      if (entry.isDirectory()) visit(full, relPath);
+      else if (entry.isFile()) out.push({ full, rel: relPath, size: fs.statSync(full).size });
+    }
+  };
+  visit(root, "");
+  return out;
+}
+
+function syncStatePath(remoteRoot) {
+  const key = crypto.createHash("sha1").update(remoteRoot).digest("hex").slice(0, 16);
+  return path.join(SYNC_STATE_DIR, `${key}.json`);
+}
+
+async function diskSync(localDir, remoteDir, opts = {}) {
+  const token = getToken();
+  const root = path.resolve(localDir);
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+    throw new Error(`not a directory: ${root}`);
+  }
+  const remoteRoot = `/${remoteDir.replace(/^\/+|\/+$/g, "")}`;
+
+  const infoRes = await apiRequest("GET", "cloud-api.yandex.net", "/v1/disk/", token);
+  const info = JSON.parse(infoRes.body.toString());
+  const free = info.total_space - info.used_space;
+
+  const files = walkTree(root, opts.exclude || []);
+  const oversized = files.filter((f) => f.size > MAX_FILE_BYTES);
+  const todo = files.filter((f) => f.size <= MAX_FILE_BYTES);
+  const total = todo.reduce((s, f) => s + f.size, 0);
+
+  console.log(`Disk: ${formatBytes(free)} free of ${formatBytes(info.total_space)}`);
+  console.log(`${todo.length} files, ${formatBytes(total)} → ${remoteRoot}`);
+  for (const f of oversized) {
+    console.log(`  SKIP (over ${formatBytes(MAX_FILE_BYTES)}): ${f.rel} (${formatBytes(f.size)})`);
+  }
+  if (total > free) throw new Error(`need ${formatBytes(total)}, only ${formatBytes(free)} free`);
+  if (opts.dryRun) {
+    for (const f of todo) console.log(`  would upload ${formatBytes(f.size).padStart(9)}  ${f.rel}`);
+    return oversized.length === 0;
+  }
+
+  fs.mkdirSync(SYNC_STATE_DIR, { recursive: true });
+  const statePath = syncStatePath(remoteRoot);
+  let state = {};
+  if (fs.existsSync(statePath)) {
+    try {
+      state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    } catch {
+      state = {};
+    }
+  }
+  const saveState = () =>
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 0), { mode: 0o600 });
+
+  const made = new Set();
+  await ensureRemoteDir(remoteRoot, token, made);
+
+  const failed = [];
+  let doneBytes = 0;
+  let cursor = 0;
+  let sinceSave = 0;
+
+  // Yandex throttles per connection, not per account: measured 0.25 MB/s on one
+  // stream and 0.505 MB/s on two (2.02x, near-linear). One stream therefore
+  // leaves most of the link idle, so uploads run through a small worker pool.
+  const worker = async () => {
+    for (;;) {
+      const i = cursor;
+      cursor += 1;
+      if (i >= todo.length) return;
+      const f = todo[i];
+      const remotePath = `${remoteRoot}/${f.rel}`;
+      const tag = `[${i + 1}/${todo.length}]`;
+      try {
+        const md5 = await fileMd5(f.full);
+        if (state[remotePath] === md5) {
+          doneBytes += f.size;
+          console.log(`${tag} skip ${f.rel}`);
+          continue;
+        }
+        const existing = await withRetries(() => diskStat(remotePath, token), `stat ${f.rel}`);
+        if (existing && existing.md5 === md5) {
+          state[remotePath] = md5;
+          doneBytes += f.size;
+          console.log(`${tag} skip (verified) ${f.rel}`);
+          continue;
+        }
+        await ensureRemoteDir(path.posix.dirname(remotePath), token, made);
+        console.log(`${tag} ${formatBytes(f.size).padStart(9)}  ${f.rel}`);
+        await withRetries(() => uploadOne(f.full, remotePath, token), `upload ${f.rel}`);
+
+        // Verify against what the server actually stored, not against a 201.
+        const check = await withRetries(() => diskStat(remotePath, token), `verify ${f.rel}`);
+        if (!check || check.md5 !== md5) {
+          failed.push([f.rel, `MD5 mismatch (server: ${check && check.md5})`]);
+          console.log(`${tag}   MD5 MISMATCH ${f.rel}`);
+          continue;
+        }
+        state[remotePath] = md5;
+        doneBytes += f.size;
+      } catch (e) {
+        failed.push([f.rel, e.message]);
+        console.log(`${tag}   FAILED ${f.rel}: ${e.message}`);
+      } finally {
+        // In a finally, so the `continue`s above still checkpoint progress.
+        sinceSave += 1;
+        if (sinceSave % 20 === 0) saveState();
+      }
+    }
+  };
+
+  const jobs = Math.max(1, Math.min(opts.jobs || 1, todo.length || 1));
+  if (jobs > 1) console.log(`${jobs} parallel workers`);
+  await Promise.all(Array.from({ length: jobs }, () => worker()));
+  saveState();
+
+  console.log(`\nVerified ${formatBytes(doneBytes)} of ${formatBytes(total)}`);
+  for (const [rel, why] of failed) console.log(`  FAILED ${rel}: ${why}`);
+  const ok = failed.length === 0 && oversized.length === 0;
+  console.log(ok ? "ALL VERIFIED" : `INCOMPLETE — ${failed.length + oversized.length} unresolved`);
+  return ok;
 }
 
 // --- Calendar (CalDAV) ---
@@ -842,8 +1104,37 @@ async function main() {
               process.exit(1);
             }
             return diskDownload(args[0], args[1]);
+          case "sync": {
+            const positional = args.filter(
+              (a, idx) => !a.startsWith("--") && args[idx - 1] !== "--exclude" && args[idx - 1] !== "--jobs",
+            );
+            if (positional.length < 2) {
+              console.error(
+                "Usage: yax disk sync <local-dir> <remote-dir> [--jobs N] [--dry-run] [--exclude NAME]...",
+              );
+              process.exitCode = 1;
+              return;
+            }
+            const exclude = [];
+            for (let i = 0; i < args.length; i += 1) {
+              if (args[i] === "--exclude" && args[i + 1]) exclude.push(args[i + 1]);
+            }
+            let jobs = 1;
+            for (let i = 0; i < args.length; i += 1) {
+              if (args[i] === "--jobs" && args[i + 1]) jobs = parseInt(args[i + 1], 10) || 1;
+              const inline = /^--jobs=(\d+)$/.exec(args[i]);
+              if (inline) jobs = parseInt(inline[1], 10) || 1;
+            }
+            const ok = await diskSync(positional[0], positional[1], {
+              dryRun: args.includes("--dry-run"),
+              exclude,
+              jobs,
+            });
+            if (!ok) process.exitCode = 1;
+            return;
+          }
           default:
-            console.log("Usage: yax disk [info|list|mkdir|upload|download]");
+            console.log("Usage: yax disk [info|list|mkdir|upload|download|sync]");
         }
         break;
       case "calendar":
@@ -899,8 +1190,12 @@ Commands:
   disk info               Disk info
   disk list [path]        List directory
   disk mkdir <path>       Create directory
-  disk upload <local> <remote>   Upload file
+  disk upload <local> <remote>   Upload file (streamed)
   disk download <remote> <local> Download file
+  disk sync <local-dir> <remote-dir> [--jobs N] [--dry-run] [--exclude NAME]
+                          Mirror a directory tree, MD5-verified and resumable.
+                          --jobs runs N uploads at once (Yandex throttles per
+                          connection, so N>1 is markedly faster)
   calendar list           List calendars
   calendar list-events    List events (date, title, UID) in all events calendars
   calendar create <summary> <YYYY-MM-DD> <HH:MM:SS> [HH:MM:SS] [desc] [tz]  Create event
@@ -926,5 +1221,5 @@ Mail commands require python3 (stdlib only).`);
 if (require.main === module) {
   main();
 } else {
-  module.exports = { icsLines, icsProp, icsMasterEvent, formatIcsDate, buildIcs, updateIcs, calendarPath, xmlUnescape };
+  module.exports = { icsLines, icsProp, icsMasterEvent, formatIcsDate, buildIcs, updateIcs, calendarPath, xmlUnescape, formatBytes, skipName, walkTree, syncStatePath };
 }

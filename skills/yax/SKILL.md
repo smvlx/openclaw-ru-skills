@@ -1,7 +1,7 @@
 ---
 name: yax
 description: CLI tool for Yandex Disk, Calendar, and Mail via Yandex OAuth API
-version: 1.4.1
+version: 1.5.0
 metadata: {"openclaw":{"emoji":"📁","homepage":"https://github.com/smvlx/awesome-ru-ai-skills","os":["darwin","linux"],"requires":{"bins":["node","python3"],"env":["YAX_CLIENT_ID"]},"primaryEnv":"YAX_CLIENT_ID","configPaths":["~/.openclaw/yax.env","~/.openclaw/yax-token.json"]}}
 ---
 
@@ -11,7 +11,7 @@ CLI tool for Yandex Disk, Calendar, and Mail via Yandex OAuth API.
 
 ## Features
 
-- **Disk**: info, list, mkdir, upload, download
+- **Disk**: info, list, mkdir, upload, download, **sync** (recursive, MD5-verified, resumable)
 - **Calendar**: list calendars, list events, create/update/delete events (via CalDAV)
 - **Mail**: IMAP via XOAUTH2 (folders, list, read, delete, **attachments**) and SMTP send. Requires `python3` (stdlib only)
 
@@ -55,6 +55,12 @@ node src/yax.cjs disk mkdir /test-folder
 node src/yax.cjs disk upload ./local-file.txt /remote-path.txt
 node src/yax.cjs disk download /remote-path.txt ./local-file.txt
 
+# Mirror a whole directory tree (recursive, MD5-verified, resumable)
+node src/yax.cjs disk sync ./local-dir /remote-dir
+node src/yax.cjs disk sync ./local-dir /remote-dir --jobs 4           # 4 uploads at once
+node src/yax.cjs disk sync ./local-dir /remote-dir --dry-run          # plan only
+node src/yax.cjs disk sync ./photos /backup/photos --exclude "*.tmp"  # extra excludes
+
 # Calendar
 node src/yax.cjs calendar list                         # список календарей
 node src/yax.cjs calendar list-events                  # события в календаре (UID + название + время)
@@ -80,6 +86,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+### [1.5.0] - 2026-09-09
+
+#### Added
+- `disk sync <local-dir> <remote-dir> [--dry-run] [--exclude NAME]` — mirrors a
+  directory tree. Every file is verified by comparing its local MD5 against the
+  `md5` Yandex reports for the stored resource, so a `201` alone is never treated
+  as success. Resumable: a file whose MD5 already matches is skipped, so an
+  interrupted run costs a checksum pass rather than a re-upload. Progress state
+  lives in `~/.openclaw/yax-sync/<hash>.json` (mode 600). Exits non-zero if any
+  file failed or was skipped as oversized, which makes it usable as a gate
+  before deleting local originals.
+- `--jobs N` on `disk sync` runs N uploads concurrently. Yandex throttles per
+  connection rather than per account — measured 0.25 MB/s on one stream and
+  0.505 MB/s on two (2.02x, near-linear), and 2.17 MB/s on five — so a single
+  stream leaves most of the link idle. Defaults to 1, which is the previous
+  behaviour.
+- `disk sync` skips build and VCS noise by default (`node_modules`, `.venv`,
+  `venv`, `__pycache__`, `.git`, `.next`, `.cache`, `.pytest_cache`, `.DS_Store`,
+  `*.pyc`) and does not follow symlinks.
+
+#### Fixed
+- `disk upload` streams the file with `fs.createReadStream` instead of reading it
+  fully into a Buffer via `readFileSync`. Uploading a multi-GB file previously
+  allocated its entire size in memory; a 1.3 GB PDF now uploads with constant
+  memory.
+- `disk upload` reports failures instead of printing `Status: <code>` and exiting
+  0, and explains a `ForbiddenError` as the missing `cloud_api:disk.write` scope.
+- Per-file size limit is enforced up front (50 GB, the Yandex 360 cap) with a
+  clear message, rather than failing mid-transfer with HTTP 413.
+- Transient failures (5xx, 429, socket errors) retry with exponential backoff;
+  4xx still fails immediately.
+- `scripts/setup.sh` creates `~/.openclaw` if missing (it previously failed when
+  the directory did not exist) and writes `yax.env` with mode 600 — the file
+  holds an OAuth client secret and was world-readable.
 
 ### [1.4.1] - 2026-09-03
 
@@ -141,6 +182,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Решение:** Токен жив 1 год, но после изменения прав приложения нужна повторная авторизация. Старые токены остаются рабочими до истечения, но с новыми scopes — только после re-auth.
 
 - **Calendar**: Uses raw CalDAV HTTP requests to `caldav.yandex.ru` (Node, no npm dependencies). Discovers the user login via the OAuth info endpoint and calendar collections via PROPFIND; `update`/`delete` look the UID up in every events calendar. `update` rewrites only DTSTART/DTEND/SUMMARY/DESCRIPTION of the master VEVENT and keeps everything else. Supports timezone-aware event creation.
+- **Disk sync concurrency**: files are pulled from one shared cursor by N
+  workers, so a slow large file never blocks the others. Progress is
+  checkpointed every 20 completions regardless of which worker finished them.
+- **Disk sync**: `disk sync` walks the tree, creates remote directories (tolerating the documented 409 "already exists"), requests a per-file upload href and streams the body to it. Verification re-reads the resource metadata and compares `md5`; a mismatch is reported as a failure rather than logged and forgotten. State is keyed by a hash of the remote root, so two different syncs never share a resume file.
 - **Mail**: `src/mail.py` — IMAP/SMTP via XOAUTH2 using only the Python 3 stdlib (`imaplib`, `smtplib`, `email`); no pip packages, but `python3` must be installed. The mailbox address is taken from the token owner (`login.yandex.ru/info`). Requires `mail:imap_full` (and `mail:smtp` for `send`) OAuth scopes. Message identifiers are IMAP UIDs, stable within a folder.
 
 ## Scripts
